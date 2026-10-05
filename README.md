@@ -1,78 +1,70 @@
 # pi-sensenova-provider
 
-Pi provider extension for the [SenseNova Token Plan](https://platform.sensenova.cn/docs) platform.
+用于 [SenseNova Token Plan](https://platform.sensenova.cn/docs) 平台的 Pi provider 扩展。
 
-Talks to the platform's real endpoints instead of guessing at them:
+直接对接平台真实接口,而不是靠猜测:
 
-| Endpoint | Used for | pi-ai implementation |
+| 接口 | 用途 | pi-ai 实现 |
 |---|---|---|
-| `GET /v1/models` | live model discovery | `fetchModels` |
-| `POST /v1/responses` | OpenAI **Responses** API chat | built-in `openai-responses` |
-| `POST /v1/chat/completions` | OpenAI **Chat Completions** chat | built-in `openai-completions` |
-| `POST /v1/images/generations` | image generation | this extension |
-| `POST /v1/images/edits` | reference-image editing | this extension |
+| `GET /v1/models` | 实时模型发现 | `fetchModels` |
+| `POST /v1/responses` | OpenAI **Responses** API 对话 | 内置 `openai-responses` |
+| `POST /v1/chat/completions` | OpenAI **Chat Completions** 对话 | 内置 `openai-completions` |
+| `POST /v1/images/generations` | 图像生成 | 本扩展 |
+| `POST /v1/images/edits` | 参考图编辑 | 本扩展 |
 
-Chat streaming is delegated to pi-ai's built-in adapters, so message conversion,
-tool calling, reasoning streaming, usage accounting, cancellation and retries are
-pi's rather than a reimplementation here.
+聊天流式处理委托给 pi-ai 内置适配器,消息转换、工具调用、推理流式、用量统计、取消与重试全部沿用 pi 的实现,不在这里重写。
 
-## Install
+## 安装
 
-From npm, once published:
+发布到 npm 之后:
 
 ```bash
 pi install npm:pi-sensenova-provider
 ```
 
-Or straight from git while it is local-only:
+尚未发布时可直接从 git 安装:
 
 ```bash
 pi install https://github.com/NoMoreWaiting/pi-sensenova-provider
 ```
 
-Coming from the earlier `npm:pi-sensenova` package? Remove it first — both
-register the same `sensenova` provider id:
+从早期的 `npm:pi-sensenova` 迁移过来?先卸掉旧包——两者注册的是同一个 `sensenova` provider id:
 
 ```bash
 pi remove npm:pi-sensenova
 ```
 
-The provider id stays `sensenova`, so `/login sensenova`, `/sensenova-*` commands
-and the `sensenova/<model>` selectors in `settings.json` keep working unchanged.
+provider id 仍是 `sensenova`,所以 `/login sensenova`、`/sensenova-*` 命令以及 `settings.json` 里的 `sensenova/<model>` 选择器都不需要改动。
 
-Developing from this checkout:
+在本目录开发调试:
 
 ```bash
 pi -e ./extensions/sensenova.ts
 ```
 
-## Configure
+## 配置
 
 ```bash
 export SENSENOVA_API_KEY="sk-..."
 ```
 
-or let Pi manage the credential interactively:
+或者让 Pi 交互式管理凭据:
 
 ```text
 /login sensenova
 ```
 
-The key is stored in `~/.pi/agent/auth.json`; `SENSENOVA_API_KEY` is the fallback.
-Keys are created at <https://platform.sensenova.cn/console> → Management Center →
-API Key Management.
+Key 会写入 `~/.pi/agent/auth.json`,`SENSENOVA_API_KEY` 作为回退。Key 在 <https://platform.sensenova.cn/console> → Management Center → API Key Management 创建。
 
-## Models
+## 模型
 
-A seed catalog is registered synchronously so Pi starts instantly and works
-offline. A background refresh replaces and extends it from `/v1/models`, and the
-result is persisted so discovered models survive restarts.
+启动时同步注册一份种子目录,使 Pi 能立刻启动并支持离线使用;随后后台从 `/v1/models` 刷新并扩充,结果会持久化,所以新发现的模型在重启后依然存在。
 
-Seed (snapshot of the live catalog):
+种子目录(实时目录快照):
 
-| Model | Type | API | Context | Max output |
+| 模型 | 类型 | API | 上下文 | 最大输出 |
 |---|---|---|---:|---:|
-| `sensenova-6.8-flash-lite` | chat, text+image in | responses | 262144 | 65536 |
+| `sensenova-6.8-flash-lite` | chat,文本+图像输入 | responses | 262144 | 65536 |
 | `deepseek-v4-flash` | chat | responses | 1048576 | 65536 |
 | `deepseek-v4.1-flash` | chat | responses | 1048576 | 65536 |
 | `glm-5.2` | chat | responses | 1048576 | 131072 |
@@ -80,42 +72,24 @@ Seed (snapshot of the live catalog):
 | `sensenova-u1-fast` | image | images | — | — |
 | `sensenova-u1.5-lite` | image | images | — | — |
 
-Models the platform serves on `/v1/responses` route there; anything else falls
-back to `/v1/chat/completions`. Add a model to `RESPONSES_MODELS` in
-`extensions/sensenova.ts` when the platform expands that list.
+平台支持 `/v1/responses` 的模型会路由到该接口,其余回退到 `/v1/chat/completions`。平台扩充该列表时,把模型加到 `extensions/sensenova.ts` 的 `RESPONSES_MODELS` 即可。
 
-### Endpoint capabilities verified against the live gateway
+### 已在真实网关上验证的接口能力
 
-- `store: true` is rejected (`store=true is not supported in stateless mode`) and
-  `previous_response_id` is rejected (`pass the complete history in input`). pi's
-  Responses adapter already sends `store: false` plus the full transcript, which
-  is what the gateway wants.
-- `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_options`,
-  `include: ["reasoning.encrypted_content"]`, `strict: true` tools,
-  `parallel_tool_calls`, `service_tier` are all accepted on `/v1/responses`.
-- `developer` works as a role on `/v1/responses` but is rejected on
-  `/v1/chat/completions`, so completions models set
-  `supportsDeveloperRole: false` and pi folds it into `system`.
-- `reasoning.effort` accepts `none | low | medium | high | xhigh`. `none` returns
-  zero reasoning tokens. `reasoning.summary: "none"` is rejected, so pi's default
-  `summary: "auto"` is used.
-- Chat Completions accepts pi's full payload shape: `stream_options`,
-  `store: false`, `thinking: { type }`, `reasoning_effort`, `max_tokens`.
-- `text.format` JSON-schema constrained output works on `deepseek-v4-flash`,
-  `glm-5.2` and `kimi-k3`, but fails on `sensenova-6.8-flash-lite` with an
-  upstream `compile_grammar_error`. Only the verified models enable
-  `supportsOpenAIGrammarTools`.
-- Image edits require PNG/JPEG/WebP, ≤10 MB, 256–4096 px on each side, aspect
-  ratio within 2:1.
-- Pricing in `/v1/models` is reported as `0` for every model during the
-  token-plan preview.
+- `store: true` 被拒绝(`store=true is not supported in stateless mode`),`previous_response_id` 也被拒绝(`pass the complete history in input`)。pi 的 Responses 适配器本来就发送 `store: false` 加完整对话历史,正好符合网关要求。
+- `prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options`、`include: ["reasoning.encrypted_content"]`、工具 `strict: true`、`parallel_tool_calls`、`service_tier` 在 `/v1/responses` 上全部被接受。
+- `developer` 角色在 `/v1/responses` 上可用,但在 `/v1/chat/completions` 上被拒绝,所以 completions 模型设置 `supportsDeveloperRole: false`,由 pi 折叠进 `system`。
+- `reasoning.effort` 接受 `none | low | medium | high | xhigh`,`none` 返回零推理 token。`reasoning.summary: "none"` 被拒绝,因此沿用 pi 默认的 `summary: "auto"`。
+- Chat Completions 接受 pi 的完整 payload 形状:`stream_options`、`store: false`、`thinking: { type }`、`reasoning_effort`、`max_tokens`。
+- `text.format` JSON Schema 约束输出在 `deepseek-v4-flash`、`glm-5.2`、`kimi-k3` 上可用,但在 `sensenova-6.8-flash-lite` 上因上游 `compile_grammar_error` 失败。只有已验证的模型开启 `supportsOpenAIGrammarTools`。
+- 图像编辑要求 PNG/JPEG/WebP、≤10 MB、宽高均在 256–4096 px 之间、宽高比不超过 2:1。
+- Token Plan 预览期内,`/v1/models` 返回的所有模型价格均为 `0`。
 
-## Thinking levels
+## 思考等级
 
-`reasoning: true` is taken from the model's `supported_features`, so newly
-discovered models get it automatically. pi levels map to the gateway as follows:
+`reasoning: true` 取自模型的 `supported_features`,新发现的模型会自动获得该标记。pi 等级到网关参数的映射如下:
 
-| pi level | `/v1/responses` | `/v1/chat/completions` |
+| pi 等级 | `/v1/responses` | `/v1/chat/completions` |
 |---|---|---|
 | off | `reasoning.effort: "none"` | `thinking: { type: "disabled" }` |
 | minimal | `"low"` | `"low"` |
@@ -125,40 +99,32 @@ discovered models get it automatically. pi levels map to the gateway as follows:
 | xhigh | `"xhigh"` | `"high"` |
 | max | `"xhigh"` | `"high"` |
 
-Note the Responses default: when no thinking level is requested, pi sends
-`reasoning.effort: "none"`, so the model answers without a thinking pass. Set a
-thinking level in Pi settings to get reasoning.
+注意 Responses 的默认行为:未指定思考等级时,pi 会发送 `reasoning.effort: "none"`,模型不会做推理直接回答。需要在 Pi 设置里指定思考等级才会产生推理。
 
-## Image generation
+## 图像生成
 
-Image-output models are registered as `type: "image"`, so they are available to
-`models.getAvailableOfType("image")` and `models.generateImages()` in
-[codemode](../node_modules/@earendil-works/pi-coding-agent/docs/codemode.md):
+图像输出模型注册为 `type: "image"`,因此可在 [codemode](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/codemode.md) 中通过 `models.getAvailableOfType("image")` 和 `models.generateImages()` 使用:
 
 ```javascript
 const painter = await models.getModelOfType("image", "sensenova", "sensenova-u1.5-lite");
 const result = await models.generateImages(painter, {
   input: [
     { type: "text", text: "A poster for a Rust workshop" },
-    { type: "image", data: base64, mimeType: "image/png" }, // optional reference
+    { type: "image", data: base64, mimeType: "image/png" }, // 可选的参考图
   ],
 });
 for (const block of result.output) if (block.type === "image") image(block);
 ```
 
-Reference images route to `/v1/images/edits`; plain prompts go to
-`/v1/images/generations`. Both request `response_format: "b64_json"`, so the
-image block is returned inline for Pi to render. A durable copy is also written
-under `.pi/generated-images/` because Pi does not persist generated images to
-disk itself, and the saved path is reported as a clickable link.
+带参考图时走 `/v1/images/edits`,纯文本提示走 `/v1/images/generations`。两者都请求 `response_format: "b64_json"`,图片以 base64 内联返回供 Pi 直接渲染。同时会额外写一份到 `.pi/generated-images/`(Pi 本身不会把生成图像落盘),保存路径以可点击链接形式报出。
 
-## Commands
+## 命令
 
-| Command | Description |
+| 命令 | 说明 |
 |---|---|
-| `/sensenova-models [filter]` | List models with API routing, capabilities and limits. Filters: `reasoning`, `vision`, `image`, `responses`, `tools`. |
-| `/sensenova-refresh` | Force a re-fetch of the catalog from `/v1/models`. |
-| `/sensenova-usage` | Tokens and cost from completed assistant messages in the current Pi process. |
+| `/sensenova-models [filter]` | 列出模型及其 API 路由、能力与限额。过滤器:`reasoning`、`vision`、`image`、`responses`、`tools`。 |
+| `/sensenova-refresh` | 强制从 `/v1/models` 重新拉取目录。 |
+| `/sensenova-usage` | 统计当前 Pi 进程中已完成的助手消息 token 与花费。 |
 
 ```text
 /sensenova-models
@@ -168,31 +134,43 @@ disk itself, and the saved path is reported as a clickable link.
 /sensenova-usage
 ```
 
-`/sensenova-usage` is process-local. SenseNova does not expose a uniform
-account-level billing endpoint through this provider.
+`/sensenova-usage` 统计范围仅限本进程。本 provider 不暴露账户级统一计费接口。
 
-## Develop
+## 开发
 
-Peer dependencies (`@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`)
-are supplied by Pi at runtime and are not bundled.
+Peer 依赖(`@earendil-works/pi-ai`、`@earendil-works/pi-coding-agent`)由 Pi 在运行时提供,不随包分发。
 
 ```bash
-npm test                          # 26 unit tests, no network
-npm run smoke                     # end-to-end against the live gateway
-npm pack --dry-run                # verify the published file list
+npm test                          # 26 个单元测试,不联网
+npm run smoke                     # 打真实网关的端到端检查
+npm pack --dry-run                # 校验打包文件清单
 ```
 
-`npm run smoke` needs `SENSENOVA_API_KEY` and hits the real platform; it walks
-catalog discovery, Responses chat, tool calling, thinking off/on, the Chat
-Completions fallback branch, vision input and image generation, and reports each
-as a pass/fail check.
+`npm run smoke` 需要 `SENSENOVA_API_KEY`,会访问真实平台,依次覆盖目录发现、Responses 对话、工具调用、推理开/关、Chat Completions 回退分支、视觉输入与图像生成,每项给出通过/失败结论。
 
-`node_modules` is not committed; for local development symlink it at the Pi
-installation's `node_modules` so the peer dependencies resolve:
+`node_modules` 不提交。本地开发时需要 peer 依赖可解析,两种方式任选其一:
+
+按 CI 同样的方式安装(与 Pi 的安装布局无关,最稳妥):
 
 ```bash
-ln -s "$(pi --version >/dev/null 2>&1 && node -p "require.resolve('@earendil-works/pi-ai')")/.." node_modules
+npm install --no-save --ignore-scripts \
+  @earendil-works/pi-ai \
+  @earendil-works/pi-coding-agent \
+  @earendil-works/pi-tui
 ```
 
-`node --test` runs the TypeScript extension directly via Node's native type
-stripping.
+或者软链到本机 Pi 的依赖目录,省去重复下载。Pi 包自身的 `node_modules` 里带了
+`@earendil-works/*`,路径可用 `pi root` 或 npm 的全局前缀推导,下面这段兼容
+`pi-web` 之类的聚合包布局:
+
+```bash
+SRC=$(find "$(npm root -g)" -maxdepth 6 -type d -path "*/@earendil-works/pi-ai" \
+      -not -path "*/dist/*" | head -1)
+[ -n "$SRC" ] && ln -s "$(dirname "$(dirname "$SRC")")" node_modules
+```
+
+`node --test` 通过 Node 原生类型剥离直接运行 TypeScript 扩展,因此需要 Node ≥ 22.19。
+
+## 许可证
+
+[MIT](./LICENSE)
