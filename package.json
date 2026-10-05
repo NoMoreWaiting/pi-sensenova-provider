@@ -19,6 +19,7 @@
   },
   "files": [
     "extensions",
+    "scripts",
     "README.md"
   ],
   "publishConfig": {
@@ -26,7 +27,8 @@
   },
   "scripts": {
     "test": "node --test",
-    "smoke": "node scripts/smoke-live.mjs"
+    "smoke": "node scripts/smoke-live.mjs",
+    "demo:ratelimit": "node scripts/demo-ratelimit.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
