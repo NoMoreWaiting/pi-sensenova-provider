@@ -102,19 +102,18 @@ const RESPONSES_MODELS = new Set([
 const GRAMMAR_OUTPUT_MODELS = new Set([]);
 
 /**
- * pi thinking levels -> `reasoning.effort` accepted by /v1/responses.
- * Verified values: none, low, medium, high, xhigh. `none` yields zero
- * reasoning tokens; `summary: "none"` is rejected, so pi's default `summary:
- * "auto"` is the only safe summary value.
+ * Default thinking level maps for models that support reasoning.
+ * Unsupported levels are explicitly mapped to null so Pi's getSupportedThinkingLevels()
+ * accurately reflects supported levels without synthetic mappings (e.g. minimal->low).
  */
 const RESPONSES_THINKING_LEVELS = {
   off: "none",
-  minimal: "low",
+  minimal: null,
   low: "low",
   medium: "medium",
   high: "high",
-  xhigh: "xhigh",
-  max: "xhigh",
+  xhigh: null,
+  max: null,
 };
 
 /**
@@ -123,13 +122,59 @@ const RESPONSES_THINKING_LEVELS = {
  */
 const COMPLETIONS_THINKING_LEVELS = {
   off: "none",
-  minimal: "low",
+  minimal: null,
   low: "low",
   medium: "medium",
   high: "high",
-  xhigh: "high",
-  max: "high",
+  xhigh: null,
+  max: null,
 };
+
+/**
+ * Official reasoning_effort specifications documented on https://platform.sensenova.cn/docs.
+ * Maps model IDs to their documented levels: none, minimal, low, medium, high, xhigh, max.
+ */
+const DOC_MODEL_REASONING_EFFORTS = {
+  "sensenova-6.8-flash-lite": ["none", "low", "medium", "high", "max"],
+  "deepseek-v4-flash": ["none", "low", "medium", "high", "max"],
+  "deepseek-v4.1-flash": ["none", "low", "medium", "high", "max"],
+  "deepseek-v4-pro": ["none", "low", "medium", "high", "max"],
+  "deepseek-flash": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  "glm-5.2": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+  "kimi-k3": ["none", "low", "medium", "high", "max"],
+};
+
+/**
+ * Builds the ThinkingLevelMap for a model.
+ * Priority:
+ * 1. Dynamic metadata from raw.supported_reasoning_efforts (or levels)
+ * 2. Official SenseNova documentation specifications (DOC_MODEL_REASONING_EFFORTS)
+ * 3. Default fallback (RESPONSES_THINKING_LEVELS or COMPLETIONS_THINKING_LEVELS)
+ * Unsupported levels are set to null so Pi's getSupportedThinkingLevels() accurately
+ * knows which levels are supported without synthetic aliasing.
+ */
+function buildThinkingLevelMap(raw, api, modelId) {
+  const rawEfforts = Array.isArray(raw?.supported_reasoning_efforts)
+    ? raw.supported_reasoning_efforts
+    : Array.isArray(raw?.supported_reasoning_levels)
+      ? raw.supported_reasoning_levels
+      : DOC_MODEL_REASONING_EFFORTS[modelId?.toLowerCase?.()] || null;
+
+  if (rawEfforts) {
+    const set = new Set(rawEfforts.map((e) => String(e).toLowerCase()));
+    return {
+      off: set.has("none") || set.has("off") ? "none" : null,
+      minimal: set.has("minimal") ? "minimal" : null,
+      low: set.has("low") ? "low" : null,
+      medium: set.has("medium") ? "medium" : null,
+      high: set.has("high") ? "high" : null,
+      xhigh: set.has("xhigh") ? "xhigh" : null,
+      max: set.has("max") ? "max" : null,
+    };
+  }
+
+  return api === RESPONSES_API ? RESPONSES_THINKING_LEVELS : COMPLETIONS_THINKING_LEVELS;
+}
 
 const DEFAULT_CONTEXT_WINDOW = 131072;
 const DEFAULT_MAX_TOKENS = 32768;
@@ -675,7 +720,7 @@ function toPiModel(raw) {
     contextWindow: toInt(raw.context_length, DEFAULT_CONTEXT_WINDOW),
     maxTokens: toInt(raw.max_output_length, DEFAULT_MAX_TOKENS),
     ...(reasoning
-      ? { thinkingLevelMap: base.api === RESPONSES_API ? RESPONSES_THINKING_LEVELS : COMPLETIONS_THINKING_LEVELS }
+      ? { thinkingLevelMap: buildThinkingLevelMap(raw, base.api, id) }
       : {}),
     compat:
       base.api === RESPONSES_API
@@ -717,6 +762,7 @@ const SEED_CATALOG = [
     context_length: 262144,
     max_output_length: 65536,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "low", "medium", "high", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -731,6 +777,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 65536,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "low", "medium", "high", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -744,6 +791,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 65536,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "low", "medium", "high", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -757,6 +805,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 131072,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "low", "medium", "high", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -770,6 +819,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 65536,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -783,6 +833,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 131072,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -796,6 +847,7 @@ const SEED_CATALOG = [
     context_length: 1048576,
     max_output_length: 65536,
     supported_features: ["tools", "json_mode", "reasoning"],
+    supported_reasoning_efforts: ["none", "low", "medium", "high", "max"],
     supported_sampling_parameters: ["temperature", "stop"],
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
@@ -1177,7 +1229,19 @@ function registerModelCommands(pi) {
         "|---|---|---|:---:|:---:|---:|---:|---:|---:|",
         ...rows.map((model) => {
           const isImage = model.type === "image";
-          return `| \`${model.id}\` | ${isImage ? "image" : "chat"} | ${model.api === RESPONSES_API ? "responses" : model.api === COMPLETIONS_API ? "chat-completions" : model.api} | ${mark(model.reasoning)} | ${mark(
+          const levels =
+            model.reasoning && model.thinkingLevelMap
+              ? Object.entries(model.thinkingLevelMap)
+                  .filter(([k, v]) => v !== null && (k !== "xhigh" && k !== "max" || v !== undefined))
+                  .map(([k]) => k)
+                  .join(", ")
+              : "";
+          const reasoningDisplay = model.reasoning
+            ? levels
+              ? `✓ (${levels})`
+              : "✓"
+            : "—";
+          return `| \`${model.id}\` | ${isImage ? "image" : "chat"} | ${model.api === RESPONSES_API ? "responses" : model.api === COMPLETIONS_API ? "chat-completions" : model.api} | ${reasoningDisplay} | ${mark(
             Array.isArray(model.input) && model.input.includes("image"),
           )} | ${formatSize(model.contextWindow ?? 0)} | ${formatSize(model.maxTokens ?? 0)} | ${formatPrice(model.cost?.input)} | ${formatPrice(model.cost?.output)} |`;
         }),
@@ -1423,4 +1487,5 @@ export const __testing = {
   RETRYABLE_STATUS,
   sleep,
   sanitizeResponsesParams,
+  buildThinkingLevelMap,
 };

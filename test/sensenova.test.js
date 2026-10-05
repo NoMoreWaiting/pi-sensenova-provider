@@ -189,27 +189,78 @@ test("grammar tools are disabled to prevent compile_grammar_error", () => {
   assert.equal(flagship.compat.supportsOpenAIGrammarTools, false);
 });
 
-test("thinking level maps use values the gateway accepts", () => {
+test("thinking level maps use values the gateway accepts and mark unsupported levels as null", () => {
   // Live-verified reasoning.effort values on /v1/responses.
   const responsesAllowed = new Set(["none", "low", "medium", "high", "xhigh"]);
   assert.deepEqual(sn.RESPONSES_THINKING_LEVELS.off, "none");
   for (const value of Object.values(sn.RESPONSES_THINKING_LEVELS)) {
+    if (value === null) continue;
     assert.ok(responsesAllowed.has(value), `unexpected reasoning.effort value: ${value}`);
   }
 
   // OpenAI-style reasoning_effort vocabulary on the completions path.
   const completionsAllowed = new Set(["low", "medium", "high"]);
   for (const [level, value] of Object.entries(sn.COMPLETIONS_THINKING_LEVELS)) {
-    if (level === "off") continue;
+    if (level === "off" || value === null) continue;
     assert.ok(completionsAllowed.has(value), `unexpected reasoning_effort value: ${value}`);
   }
 
-  // Every pi thinking level is mapped on both paths.
+  // Every pi thinking level is defined (either string value or null for unsupported).
   const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
   for (const level of levels) {
     assert.notEqual(sn.RESPONSES_THINKING_LEVELS[level], undefined, `responses map misses ${level}`);
     assert.notEqual(sn.COMPLETIONS_THINKING_LEVELS[level], undefined, `completions map misses ${level}`);
   }
+
+  // Unsupported levels are explicitly null, not mapped via synthetic aliases.
+  assert.equal(sn.RESPONSES_THINKING_LEVELS.minimal, null);
+  assert.equal(sn.RESPONSES_THINKING_LEVELS.xhigh, null);
+  assert.equal(sn.RESPONSES_THINKING_LEVELS.max, null);
+  assert.equal(sn.COMPLETIONS_THINKING_LEVELS.minimal, null);
+  assert.equal(sn.COMPLETIONS_THINKING_LEVELS.xhigh, null);
+  assert.equal(sn.COMPLETIONS_THINKING_LEVELS.max, null);
+});
+
+test("buildThinkingLevelMap configures model-specific supported levels without synthetic mappings", async () => {
+  const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai");
+
+  // Dynamic derivation from raw supported_reasoning_efforts metadata
+  const custom = sn.buildThinkingLevelMap(
+    { supported_reasoning_efforts: ["none", "low", "medium", "high"] },
+    "openai-responses",
+    "custom-model",
+  );
+  assert.deepEqual(custom, {
+    off: "none",
+    minimal: null,
+    low: "low",
+    medium: "medium",
+    high: "high",
+    xhigh: null,
+    max: null,
+  });
+
+  // DeepSeek models align with official documentation [off, low, medium, high, max]
+  const deepseek = sn.toPiModel({
+    id: "deepseek-v4-pro",
+    output_modalities: ["text"],
+    context_length: 1048576,
+    max_output_length: 131072,
+    supported_features: ["reasoning"],
+    pricing: {},
+  });
+  assert.deepEqual(getSupportedThinkingLevels(deepseek), ["off", "low", "medium", "high", "max"]);
+
+  // SenseNova 6.8 Flash Lite aligns with official documentation [off, low, medium, high, max]
+  const flashLite = sn.toPiModel({
+    id: "sensenova-6.8-flash-lite",
+    output_modalities: ["text"],
+    context_length: 262144,
+    max_output_length: 65536,
+    supported_features: ["reasoning"],
+    pricing: {},
+  });
+  assert.deepEqual(getSupportedThinkingLevels(flashLite), ["off", "low", "medium", "high", "max"]);
 });
 
 test("pricing converts per-million strings and defaults missing values to 0", () => {
