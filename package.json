@@ -1,0 +1,44 @@
+{
+  "name": "pi-sensenova-provider",
+  "version": "2.0.0",
+  "description": "Pi provider extension for SenseNova Token Plan (OpenAI Responses + Chat Completions + image APIs)",
+  "keywords": [
+    "pi-sensenova-provider",
+    "pi-package",
+    "SenseNova",
+    "SenseTime",
+    "Token Plan",
+    "日日新"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NoMoreWaiting/pi-sensenova-provider.git",
+    "directory": "."
+  },
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "test": "node --test",
+    "smoke": "node scripts/smoke-live.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "homepage": "https://github.com/NoMoreWaiting/pi-sensenova-provider",
+  "bugs": {
+    "url": "https://github.com/NoMoreWaiting/pi-sensenova-provider/issues"
+  }
+}
