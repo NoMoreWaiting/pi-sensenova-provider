@@ -80,7 +80,7 @@ test("Responses-eligible models route to /v1/responses", () => {
 
 test("models outside the Responses set fall back to chat completions", () => {
   const model = toPiModel({
-    id: "deepseek-v4-pro",
+    id: "custom-legacy-model",
     input_modalities: ["text"],
     output_modalities: ["text"],
     context_length: 1048576,
@@ -94,7 +94,7 @@ test("models outside the Responses set fall back to chat completions", () => {
 
 test("chat completions compat disables the developer role and uses max_tokens", () => {
   const model = toPiModel({
-    id: "deepseek-v4-pro",
+    id: "custom-legacy-model",
     output_modalities: ["text"],
     context_length: 1000,
     max_output_length: 100,
@@ -103,7 +103,10 @@ test("chat completions compat disables the developer role and uses max_tokens", 
   });
   assert.equal(model.compat.supportsDeveloperRole, false);
   assert.equal(model.compat.maxTokensField, "max_tokens");
-  assert.equal(model.compat.thinkingFormat, "deepseek");
+  assert.notEqual(model.compat.thinkingFormat, "deepseek");
+  assert.equal(model.compat.thinkingFormat, "openai");
+  assert.equal(model.compat.supportsStore, false);
+  assert.equal(model.compat.requiresReasoningContentOnAssistantMessages, true);
   assert.equal(model.compat.supportsReasoningEffort, true);
 });
 
@@ -120,7 +123,7 @@ test("reasoning is inferred from supported_features", () => {
   assert.ok(reasoning.thinkingLevelMap, "reasoning models get a thinking level map");
 
   const plain = toPiModel({
-    id: "sensenova-mystery",
+    id: "other-mystery",
     output_modalities: ["text"],
     context_length: 1000,
     max_output_length: 100,
@@ -129,13 +132,43 @@ test("reasoning is inferred from supported_features", () => {
   });
   assert.equal(plain.reasoning, false);
   assert.equal(plain.thinkingLevelMap, undefined);
+
+  // sensenova reasoning model recognition even without supported_features
+  const flashLite = toPiModel({
+    id: "sensenova-6.8-flash-lite",
+    output_modalities: ["text"],
+    context_length: 1000,
+    max_output_length: 100,
+    supported_features: [],
+    pricing: {},
+  });
+  assert.equal(flashLite.reasoning, true, "sensenova-6.8-flash-lite is recognized as reasoning");
+
+  const titleCased = toPiModel({
+    id: "SenseNova-6.8-Flash-Lite",
+    output_modalities: ["text"],
+    context_length: 1000,
+    max_output_length: 100,
+    supported_features: [],
+    pricing: {},
+  });
+  assert.equal(titleCased.reasoning, true, "SenseNova title-cased is recognized as reasoning");
+
+  const uppercaseFeatures = toPiModel({
+    id: "custom-model",
+    output_modalities: ["text"],
+    context_length: 1000,
+    max_output_length: 100,
+    supported_features: ["REASONING"],
+    pricing: {},
+  });
+  assert.equal(uppercaseFeatures.reasoning, true, "uppercase REASONING in supported_features is recognized");
 });
 
-test("only verified models advertise grammar-constrained output", () => {
-  assert.equal(GRAMMAR_OUTPUT_MODELS.has("sensenova-6.8-flash-lite"), false);
-  assert.equal(GRAMMAR_OUTPUT_MODELS.has("glm-5.2"), true);
+test("grammar tools are disabled to prevent compile_grammar_error", () => {
+  assert.equal(GRAMMAR_OUTPUT_MODELS.size, 0, "GRAMMAR_OUTPUT_MODELS set must be empty");
 
-  const flagged = toPiModel({
+  const glm = toPiModel({
     id: "glm-5.2",
     output_modalities: ["text"],
     context_length: 1000,
@@ -143,9 +176,9 @@ test("only verified models advertise grammar-constrained output", () => {
     supported_features: ["reasoning"],
     pricing: {},
   });
-  assert.equal(flagged.compat.supportsOpenAIGrammarTools, true);
+  assert.equal(glm.compat.supportsOpenAIGrammarTools, false);
 
-  const unflagged = toPiModel({
+  const flagship = toPiModel({
     id: "sensenova-6.8-flash-lite",
     output_modalities: ["text"],
     context_length: 1000,
@@ -153,7 +186,7 @@ test("only verified models advertise grammar-constrained output", () => {
     supported_features: ["reasoning"],
     pricing: {},
   });
-  assert.equal(unflagged.compat.supportsOpenAIGrammarTools, false);
+  assert.equal(flagship.compat.supportsOpenAIGrammarTools, false);
 });
 
 test("thinking level maps use values the gateway accepts", () => {
@@ -250,7 +283,43 @@ test("prompt and reference extraction handles ImagesContext and transcripts", ()
     { prompt: "hello world", references: [] },
   );
 
+  assert.deepEqual(
+    extractPromptAndReferences({
+      messages: [
+        { role: "user", content: "draw a cat" },
+      ],
+    }),
+    { prompt: "draw a cat", references: [] },
+  );
+
   assert.deepEqual(extractPromptAndReferences({ input: [] }), { prompt: "", references: [] });
+});
+
+test("extractPromptAndReferences handles string user content without error", () => {
+  const result = extractPromptAndReferences({
+    messages: [
+      { role: "user", content: "generate a beautiful sunset" },
+    ],
+  });
+  assert.deepEqual(result, {
+    prompt: "generate a beautiful sunset",
+    references: [],
+  });
+});
+
+test("extractPromptAndReferences preserves input blocks references when prompt is in transcript", () => {
+  const result = extractPromptAndReferences({
+    input: [
+      { type: "image", data: "base64ref", mimeType: "image/png" },
+    ],
+    messages: [
+      { role: "user", content: "enhance this image" },
+    ],
+  });
+  assert.deepEqual(result, {
+    prompt: "enhance this image",
+    references: [{ data: "base64ref", mimeType: "image/png" }],
+  });
 });
 
 test("image usage maps SenseNova counters into the pi cost model", () => {
@@ -580,6 +649,96 @@ test("generateImages does not reject when the API key is missing", async () => {
   assert.match(output.errorMessage ?? "", /API key/);
 });
 
+test("generateImages respects model.baseUrl", async () => {
+  const seen = [];
+  const customBase = "https://custom.sensenova.example/v1";
+  await sn.generateImages(
+    {
+      id: "sensenova-u1-custom-base",
+      api: IMAGE_API,
+      provider: PROVIDER_ID,
+      baseUrl: `${customBase}/images`,
+      input: ["text"],
+      output: ["image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+    { messages: [{ role: "user", content: "draw a dog" }] },
+    {
+      apiKey: "sk-test",
+      fetch: async (url) => {
+        seen.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map(),
+          json: async () => ({ data: [{ b64_json: "AA==" }] }),
+        };
+      },
+    },
+  );
+  assert.equal(seen[0], `${customBase}/images/generations`);
+});
+
+test("generateImages respects model.baseUrl with trailing slash", async () => {
+  const seen = [];
+  const customBase = "https://custom.sensenova.example/v1/";
+  await sn.generateImages(
+    {
+      id: "sensenova-u1-custom-base-slash",
+      api: IMAGE_API,
+      provider: PROVIDER_ID,
+      baseUrl: customBase,
+      input: ["text"],
+      output: ["image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+    { messages: [{ role: "user", content: "draw a dog" }] },
+    {
+      apiKey: "sk-test",
+      fetch: async (url) => {
+        seen.push(String(url));
+        return {
+          ok: true,
+          status: 200,
+          headers: new Map(),
+          json: async () => ({ data: [{ b64_json: "AA==" }] }),
+        };
+      },
+    },
+  );
+  assert.equal(seen[0], "https://custom.sensenova.example/v1/images/generations");
+});
+
+test("generateImages fails fast on HTTP 403 authorization error without rate limiter cooldown", async () => {
+  const output = await sn.generateImages(
+    {
+      id: "sensenova-u1-forbidden",
+      api: IMAGE_API,
+      provider: PROVIDER_ID,
+      baseUrl: BASE_URL,
+      input: ["text"],
+      output: ["image"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    },
+    { messages: [{ role: "user", content: "draw a cat" }] },
+    {
+      apiKey: "sk-test",
+      fetch: async () => {
+        return new Response(
+          JSON.stringify({ error: { message: "model is not available in the current token plan" } }),
+          { status: 403, headers: { "content-type": "application/json" } },
+        );
+      },
+    },
+  );
+  assert.equal(output.stopReason, "error");
+  assert.match(output.errorMessage ?? "", /model is not available in the current token plan/);
+
+  const bucket = rateLimiter.bucket("sensenova-u1-forbidden");
+  assert.ok(bucket.cooldownUntil <= Date.now(), "image API 403 must not place bucket in cooldown");
+  rateLimiter.reset("sensenova-u1-forbidden");
+});
+
 test("the extension source is syntactically loadable", () => {
   const source = readFileSync(new URL("../extensions/sensenova.ts", import.meta.url), "utf8");
   assert.ok(source.includes("createProvider"), "must use the native Provider form");
@@ -692,7 +851,8 @@ test("quota exhaustion is classified separately from a rate limit", () => {
   assert.ok(isQuotaExhausted(429, "free quota exhausted"), "free quota exhausted");
   assert.ok(isQuotaExhausted(429, "FREE_QUOTA_EXHAUSTED"), "snake case code");
   assert.ok(isQuotaExhausted(429, "token plan limit exhausted"), "token plan limit");
-  assert.ok(isQuotaExhausted(403, "model is not available in the current token plan"), "token plan 403");
+  assert.ok(!isQuotaExhausted(403, "model is not available in the current token plan"), "token plan 403 is authorization error, not quota exhausted");
+  assert.ok(!isQuotaExhausted("403", "model is not available in the current token plan"), "string 403 is not quota exhausted");
 
   assert.ok(!isQuotaExhausted(429, "inference exceeds tpm/rpm limit"), "tpm/rpm is transient");
   assert.ok(!isQuotaExhausted(429, "rps exhausted"), "rps is transient");
@@ -991,5 +1151,176 @@ test("throttle command is registered and reports bucket state", async () => {
     console.log = originalLog;
     rateLimiter.reset();
   }
+});
+
+test("403 fast fail returns immediately without placing bucket in 10-minute cooldown", async () => {
+  await withConfig({ rpm: 600, burst: 5, retries: 3, maxWaitMs: 5000 }, async () => {
+    let calls = 0;
+    const inner = async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { message: "model is not available in the current token plan" } }), { status: 403 });
+    };
+    const fetchFn = makeRateLimitedFetch("forbidden-model", inner);
+    const response = await fetchFn("https://token.sensenova.cn/v1/chat/completions", { method: "POST" });
+    assert.equal(response.status, 403);
+    assert.equal(calls, 1, "403 must fail fast without retrying");
+
+    const bucket = rateLimiter.bucket("forbidden-model");
+    assert.ok(bucket.cooldownUntil <= Date.now(), "403 must not place bucket in cooldown");
+
+    // Subsequent acquire must succeed immediately without blocking
+    const start = Date.now();
+    await rateLimiter.acquire("forbidden-model", undefined);
+    assert.ok(Date.now() - start < 50, "subsequent acquire must be immediate");
+
+    // onQuotaExhausted with status 403 must be a no-op and not set cooldown
+    assert.equal(rateLimiter.onQuotaExhausted("forbidden-model", null, 403), 0);
+    assert.ok(bucket.cooldownUntil <= Date.now(), "onQuotaExhausted(403) must not set cooldown");
+
+    rateLimiter.reset("forbidden-model");
+  });
+});
+
+test("sanitizes Responses API proprietary fields (reasoning.encrypted_content, prompt_cache_key, reasoning.summary)", async () => {
+  const rawParams = {
+    model: "sensenova-6.8-flash-lite",
+    prompt_cache_key: "cache-123",
+    include: ["reasoning.encrypted_content"],
+    reasoning: { effort: "low", summary: "auto" },
+    input: [],
+  };
+  const sanitized = sn.sanitizeResponsesParams(rawParams);
+  assert.equal("prompt_cache_key" in sanitized, false);
+  assert.equal("include" in sanitized, false);
+  assert.equal("summary" in (sanitized.reasoning ?? {}), false);
+  assert.equal(sanitized.reasoning?.effort, "low");
+
+  const mixedParams = {
+    model: "sensenova-6.8-flash-lite",
+    include: ["other_item", "reasoning.encrypted_content"],
+  };
+  const mixedSanitized = sn.sanitizeResponsesParams(mixedParams);
+  assert.deepEqual(mixedSanitized.include, ["other_item"]);
+
+  // Test through fetch wrapper for /responses endpoint
+  let capturedBody;
+  const fetchImpl = async (url, init) => {
+    capturedBody = JSON.parse(init.body);
+    return new Response("{}", { status: 200 });
+  };
+  const wrappedFetch = makeRateLimitedFetch("test-responses-model", fetchImpl);
+  await wrappedFetch("https://token.sensenova.cn/v1/responses", {
+    method: "POST",
+    body: JSON.stringify({
+      model: "sensenova-6.8-flash-lite",
+      prompt_cache_key: "cache-abc",
+      include: ["reasoning.encrypted_content"],
+      reasoning: { effort: "medium", summary: "auto" },
+    }),
+  });
+  assert.equal("prompt_cache_key" in capturedBody, false);
+  assert.equal("include" in capturedBody, false);
+  assert.equal("summary" in (capturedBody.reasoning ?? {}), false);
+  assert.equal(capturedBody.reasoning?.effort, "medium");
+
+  // Test withRateLimit onPayload transformer
+  const fakeStream = {
+    stream: (_m, _c, options) => {
+      return options?.onPayload;
+    },
+  };
+  const wrappedStream = withRateLimit(fakeStream);
+  const onPayloadFn = wrappedStream.stream({ id: "sensenova-6.8-flash-lite", api: RESPONSES_API }, {}, {});
+  const res = await onPayloadFn({
+    model: "sensenova-6.8-flash-lite",
+    prompt_cache_key: "cache-xyz",
+    include: ["reasoning.encrypted_content"],
+    reasoning: { effort: "high", summary: "auto" },
+  });
+  assert.equal("prompt_cache_key" in res, false);
+  assert.equal("include" in res, false);
+  assert.equal("summary" in (res.reasoning ?? {}), false);
+  assert.equal(res.reasoning?.effort, "high");
+
+  rateLimiter.reset("test-responses-model");
+});
+
+test("chat completions streamSimple sends reasoning_effort and replayed reasoning_content without store or deepseek thinking", async () => {
+  const mod = await import("../extensions/sensenova.ts");
+  let provider;
+  mod.default({
+    registerProvider: (p) => { provider = p; },
+    registerCommand: () => {},
+    registerEntryRenderer: () => {},
+    appendEntry: () => {},
+    on: () => {},
+  });
+
+  const model = toPiModel({
+    id: "custom-completions-model",
+    output_modalities: ["text"],
+    context_length: 131072,
+    max_output_length: 100,
+    supported_features: ["reasoning", "tools"],
+    pricing: {},
+  });
+
+  let capturedInit;
+  const fakeFetch = async (_url, init) => {
+    capturedInit = init;
+    const chunk = "data: " + JSON.stringify({
+      id: "chatcmpl-1",
+      choices: [{ delta: { content: "result" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+    }) + "\n\ndata: [DONE]\n\n";
+    return new Response(chunk, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" }
+    });
+  };
+
+  const context = {
+    messages: [
+      { role: "user", content: "Calculate 2+2", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call_1", name: "calc", arguments: { expr: "2+2" } }
+        ],
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        timestamp: 2
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "calc",
+        content: [{ type: "text", text: "4" }],
+        timestamp: 3
+      }
+    ]
+  };
+
+  const stream = provider.streamSimple(model, context, {
+    apiKey: "sk-test",
+    reasoning: "low",
+    fetch: fakeFetch,
+  });
+
+  for await (const _event of stream) {}
+  const res = await stream.result();
+  assert.equal(res.stopReason, "stop");
+
+  const body = JSON.parse(capturedInit.body);
+  assert.equal("store" in body, false, "completions body must not have store field");
+  assert.equal("thinking" in body, false, "completions body must not have thinking field");
+  assert.equal(body.reasoning_effort, "low", "reasoning_effort must be sent");
+  assert.equal(body.max_tokens, 100, "max_tokens must be used");
+
+  // Multi-turn assistant message must have reasoning_content
+  const assistantMsg = body.messages.find((m) => m.role === "assistant");
+  assert.ok(assistantMsg, "replayed assistant message present");
+  assert.equal(typeof assistantMsg.reasoning_content, "string", "replayed assistant must have reasoning_content");
+
+  rateLimiter.reset("custom-completions-model");
 });
 

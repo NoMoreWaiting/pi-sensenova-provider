@@ -88,22 +88,18 @@ const RESPONSES_MODELS = new Set([
   "sensenova-6.8-flash-lite",
   "deepseek-v4-flash",
   "deepseek-v4.1-flash",
+  "deepseek-v4-pro",
+  "deepseek-flash",
   "glm-5.2",
   "kimi-k3",
 ]);
 
 /**
- * Models that accept OpenAI `text.format` grammar-constrained output. Verified
- * live: deepseek-v4-flash, glm-5.2 and kimi-k3 return valid constrained JSON
- * while sensenova-6.8-flash-lite fails with `compile_grammar_error` in the
- * upstream tokenizer. Leave false for models that were not verified.
+ * Lark grammar-constrained tool output causes `compile_grammar_error` in
+ * SenseNova's tokenizer. Grammar tools are disabled across all models so
+ * standard, reliable JSON schema tool definitions are used instead.
  */
-const GRAMMAR_OUTPUT_MODELS = new Set([
-  "deepseek-v4-flash",
-  "deepseek-v4.1-flash",
-  "glm-5.2",
-  "kimi-k3",
-]);
+const GRAMMAR_OUTPUT_MODELS = new Set([]);
 
 /**
  * pi thinking levels -> `reasoning.effort` accepted by /v1/responses.
@@ -123,7 +119,7 @@ const RESPONSES_THINKING_LEVELS = {
 
 /**
  * pi thinking levels -> `reasoning_effort` for the /v1/chat/completions path,
- * which uses the DeepSeek `thinking: { type }` shape instead.
+ * which uses standard OpenAI reasoning_effort.
  */
 const COMPLETIONS_THINKING_LEVELS = {
   off: "none",
@@ -265,13 +261,12 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
  * wait recovers.
  */
 const QUOTA_EXHAUSTED =
-  /free_quota_exhausted|quota exhausted|plan limit exhausted|token plan limit|usage limit|monthly limit|not available in the current token plan/i;
+  /free_quota_exhausted|quota exhausted|plan limit exhausted|token plan limit|usage limit|monthly limit/i;
 
 function isQuotaExhausted(status, body) {
-  // 403 from this gateway is either "model not available in the current token
-  // plan" or a risk block; neither recovers by waiting. 403 is already outside
-  // RETRYABLE_STATUS, so this only shapes the reported message.
-  if (status === 403) return /not available in the current token plan/i.test(body);
+  // 403 is an authorization/plan error, not a rate limit or sliding window quota
+  // issue. It must never trigger a quota cooldown.
+  if (status === 403 || Number(status) === 403) return false;
   return QUOTA_EXHAUSTED.test(body);
 }
 
@@ -406,6 +401,7 @@ class RateLimiter {
    * higher-level retry does not hammer an endpoint that cannot recover.
    */
   onQuotaExhausted(modelId, headers, status) {
+    if (status === 403 || Number(status) === 403) return 0;
     const bucket = this.bucket(modelId);
     const now = Date.now();
     const cooldown = this.onRateLimited(modelId, headers, { status });
@@ -472,6 +468,35 @@ function errorResponse(status, body, detail) {
 }
 
 /**
+ * Remove proprietary OpenAI Responses fields not accepted by the SenseNova
+ * Responses gateway (`reasoning.encrypted_content` and `prompt_cache_key`).
+ */
+function sanitizeResponsesParams(params) {
+  if (!params || typeof params !== "object") return params;
+  if (Array.isArray(params.include)) {
+    const filtered = params.include.filter((item) => item !== "reasoning.encrypted_content");
+    if (filtered.length > 0) {
+      params.include = filtered;
+    } else {
+      delete params.include;
+    }
+  }
+  if ("prompt_cache_key" in params) {
+    delete params.prompt_cache_key;
+  }
+  if ("prompt_cache_retention" in params) {
+    delete params.prompt_cache_retention;
+  }
+  if ("prompt_cache_options" in params) {
+    delete params.prompt_cache_options;
+  }
+  if (params.reasoning && typeof params.reasoning === "object") {
+    delete params.reasoning.summary;
+  }
+  return params;
+}
+
+/**
  * Wraps the caller's fetch so every outbound request is paced and retried.
  * Injected through pi-ai's `options.fetch`, which both built-in OpenAI adapters
  * pass straight to the OpenAI client.
@@ -485,8 +510,31 @@ function makeRateLimitedFetch(modelId, inner) {
     const signal = init?.signal;
     await rateLimiter.acquire(modelId, signal);
 
+    let finalInit = init;
+    const urlStr = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? "";
+    if (urlStr.includes("/responses") && init?.body && typeof init.body === "string") {
+      try {
+        const parsed = JSON.parse(init.body);
+        sanitizeResponsesParams(parsed);
+        finalInit = { ...init, body: JSON.stringify(parsed) };
+      } catch {
+        // Keep original body if parsing fails.
+      }
+    }
+
     for (let attempt = 0; ; attempt++) {
-      const response = await target(input, init);
+      const response = await target(input, finalInit);
+
+      if (response.status === 403) {
+        // 403 is an authorization/plan issue, not a rate limit or sliding window quota
+        // issue. Fail fast immediately without retry or placing the bucket in cooldown.
+        const bucket = rateLimiter.bucket(modelId);
+        if (bucket.cooldownUntil > Date.now()) {
+          bucket.cooldownUntil = 0;
+        }
+        rateLimiter.onSucceeded(modelId);
+        return response;
+      }
 
       if (!RETRYABLE_STATUS.has(response.status)) {
         rateLimiter.onSucceeded(modelId);
@@ -537,8 +585,23 @@ function withRateLimit(streams) {
   const wrap = (fn) => {
     if (typeof fn !== "function") return fn;
     return (model, context, options) => {
-      const { fetch: callerFetch, ...rest } = options ?? {};
-      return fn(model, context, { ...rest, fetch: makeRateLimitedFetch(model?.id, callerFetch) });
+      const { fetch: callerFetch, onPayload: callerOnPayload, ...rest } = options ?? {};
+      const onPayload = async (params, m) => {
+        let transformed = params;
+        if ((m?.api ?? model?.api) === RESPONSES_API) {
+          transformed = sanitizeResponsesParams(transformed);
+        }
+        if (typeof callerOnPayload === "function") {
+          const res = await callerOnPayload(transformed, m);
+          if (res !== undefined) transformed = res;
+        }
+        return transformed;
+      };
+      return fn(model, context, {
+        ...rest,
+        onPayload,
+        fetch: makeRateLimitedFetch(model?.id, callerFetch),
+      });
     };
   };
   const out = { ...streams };
@@ -562,7 +625,7 @@ function toPiModel(raw) {
 
   const inputModalities = stringArray(raw.input_modalities, ["text"]);
   const outputModalities = stringArray(raw.output_modalities, ["text"]);
-  const features = new Set(stringArray(raw.supported_features, []));
+  const features = new Set(stringArray(raw.supported_features, []).map((f) => f.toLowerCase()));
   const outputImage = outputModalities.includes("image");
 
   const meta = {
@@ -577,7 +640,11 @@ function toPiModel(raw) {
   const base = {
     id,
     name: typeof raw.name === "string" && raw.name ? raw.name : id,
-    api: outputImage ? IMAGE_API : RESPONSES_MODELS.has(id) ? RESPONSES_API : COMPLETIONS_API,
+    api: outputImage
+      ? IMAGE_API
+      : (RESPONSES_MODELS.has(id) || /^(sensenova|deepseek|glm-|kimi)/i.test(id))
+        ? RESPONSES_API
+        : COMPLETIONS_API,
     provider: PROVIDER_ID,
     // OpenAI SDK clients append the endpoint segment (`/responses`,
     // `/chat/completions`) to baseUrl, so this stays at the version root.
@@ -598,7 +665,7 @@ function toPiModel(raw) {
 
   const reasoning =
     features.has("reasoning") ||
-    /^(deepseek|glm-|kimi)/.test(id);
+    /^(sensenova|deepseek|glm-|kimi)/i.test(id);
 
   return {
     ...base,
@@ -616,10 +683,12 @@ function toPiModel(raw) {
             supportsDeveloperRole: true,
             supportsMaxOutputTokens: true,
             supportsStrictMode: true,
-            supportsOpenAIGrammarTools: GRAMMAR_OUTPUT_MODELS.has(id),
+            supportsOpenAIGrammarTools: false,
           }
         : {
-            thinkingFormat: "deepseek",
+            thinkingFormat: "openai",
+            supportsStore: false,
+            requiresReasoningContentOnAssistantMessages: true,
             supportsReasoningEffort: true,
             // The completions gateway rejects the `developer` role; pi folds it
             // into `system` instead.
@@ -679,6 +748,32 @@ const SEED_CATALOG = [
     pricing: { prompt: "0", completion: "0" },
     businesses: ["tokenplan"],
     description: "DeepSeek V4.1 Flash. May require a higher token plan; the gateway returns permission_denied_error otherwise.",
+  },
+  {
+    id: "deepseek-v4-pro",
+    name: "DeepSeek V4 Pro",
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    context_length: 1048576,
+    max_output_length: 131072,
+    supported_features: ["tools", "json_mode", "reasoning"],
+    supported_sampling_parameters: ["temperature", "stop"],
+    pricing: { prompt: "0", completion: "0" },
+    businesses: ["tokenplan"],
+    description: "DeepSeek V4 Pro conversational model with 1M context, 128K output and reasoning.",
+  },
+  {
+    id: "deepseek-flash",
+    name: "DeepSeek Flash",
+    input_modalities: ["text"],
+    output_modalities: ["text"],
+    context_length: 1048576,
+    max_output_length: 65536,
+    supported_features: ["tools", "json_mode", "reasoning"],
+    supported_sampling_parameters: ["temperature", "stop"],
+    pricing: { prompt: "0", completion: "0" },
+    businesses: ["tokenplan"],
+    description: "DeepSeek Flash conversational model with 1M context and reasoning.",
   },
   {
     id: "glm-5.2",
@@ -787,8 +882,6 @@ function extractPromptAndReferences(context) {
     .filter((block) => block?.type === "image" && typeof block.data === "string" && block.data.length > 0)
     .map((block) => ({ data: block.data, mimeType: block.mimeType ?? "image/png" }));
 
-  if (prompt) return { prompt, references };
-
   const user = latestUserContent(context);
   const fallbackPrompt =
     typeof user?.content === "string"
@@ -796,11 +889,13 @@ function extractPromptAndReferences(context) {
       : Array.isArray(user?.content)
         ? user.content.filter((part) => part?.type === "text").map((part) => part.text ?? "").join("\n")
         : "";
+  const userReferences = (Array.isArray(user?.content) ? user.content : [])
+    .filter((part) => part?.type === "image" && typeof part.data === "string" && part.data.length > 0)
+    .map((part) => ({ data: part.data, mimeType: part.mimeType ?? "image/png" }));
+
   return {
-    prompt: fallbackPrompt.trim(),
-    references: (user?.content ?? [])
-      .filter((part) => part?.type === "image" && typeof part.data === "string")
-      .map((part) => ({ data: part.data, mimeType: part.mimeType ?? "image/png" })),
+    prompt: (prompt || fallbackPrompt).trim(),
+    references: references.length > 0 ? references : userReferences,
   };
 }
 
@@ -865,9 +960,10 @@ async function generateImages(model, context, options) {
     const { prompt, references } = extractPromptAndReferences(context);
     if (!prompt) throw new Error("Image generation requires a text prompt");
 
+    const base = (model.baseUrl ? model.baseUrl.replace(/\/images\/?$/, "") : BASE_URL).replace(/\/+$/, "");
     const url = references.length
-      ? `${BASE_URL}/images/edits`
-      : `${BASE_URL}/images/generations`;
+      ? `${base}/images/edits`
+      : `${base}/images/generations`;
     let params = references.length
       ? {
           model: model.id,
@@ -1326,4 +1422,5 @@ export const __testing = {
   parseRetryAfterMs,
   RETRYABLE_STATUS,
   sleep,
+  sanitizeResponsesParams,
 };
