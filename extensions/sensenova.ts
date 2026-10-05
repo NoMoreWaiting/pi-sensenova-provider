@@ -1109,10 +1109,12 @@ function registerRefreshCommand(pi) {
       }
 
       const started = Date.now();
+      // `new AbortSignal()` throws in Node (ERR_ILLEGAL_CONSTRUCTOR); pi supplies
+      // its own signal when the caller omits one, so just leave it out.
       const result = await registry.refresh({
         providers: [PROVIDER_ID],
         force: true,
-        signal: ctx.signal ?? new AbortSignal(),
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
       });
       const errors = result?.errors instanceof Map ? [...result.errors.values()] : [];
       const elapsed = Math.round((Date.now() - started) / 100) / 10;

@@ -586,6 +586,14 @@ test("the extension source is syntactically loadable", () => {
   assert.ok(source.includes(RESPONSES_API), "must register the Responses API");
   assert.ok(source.includes("openai-responses.lazy"), "must load the responses adapter");
   assert.ok(source.includes("openai-completions.lazy"), "must load the completions adapter");
+
+  // Node forbids constructing AbortSignal directly (ERR_ILLEGAL_CONSTRUCTOR),
+  // which made /sensenova-refresh crash with a bare "Illegal constructor".
+  // Strip comments first so this only catches real call sites.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:\"'])\/\/.*$/gm, "$1");
+  assert.doesNotMatch(code, /new AbortSignal\b/, "never construct AbortSignal directly");
 });
 
 // ---------------------------------------------------------------------------
