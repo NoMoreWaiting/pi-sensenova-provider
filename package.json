@@ -28,7 +28,6 @@
   "scripts": {
     "test": "node --test",
     "smoke": "node scripts/smoke-live.mjs",
-    "demo:ratelimit": "node scripts/demo-ratelimit.mjs",
     "sync-docs": "node scripts/sync-docs-thinking-levels.mjs"
   },
   "peerDependencies": {

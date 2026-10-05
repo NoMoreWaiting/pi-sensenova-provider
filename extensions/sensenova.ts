@@ -214,307 +214,15 @@ function parseCost(pricing) {
 }
 
 // ---------------------------------------------------------------------------
-// Client-side rate limiting
+// Responses API payload sanitization
 //
-// The SenseNova gateway throttles per model and per endpoint (observed errors:
-// `inference exceeds tpm/rpm limit`, `rps exhausted`,
-// `RateLimitExceeded.EndpointRPMExceeded`, `inference tpm exhausted`) and does
-// not return a `Retry-After` header, so there is nothing server-supplied to pace
-// ourselves by. A shared per-model token bucket keeps the request rate under the
-// limit before it is reached, and a 429 opens a cooldown so the next requests
-// wait instead of piling onto the throttled endpoint.
-//
-// Quota exhaustion is a different failure and is never retried: the free quota is
-// a per-model sliding window (1,500 calls / 5 hours) and waiting inside the
-// window does not recover it.
+// SenseNova /v1/responses rejects proprietary OpenAI parameters like
+// reasoning.encrypted_content, prompt_cache_key, and reasoning.summary.
 // ---------------------------------------------------------------------------
-
-function boolFromEnv(name, fallback) {
-  const value = process.env[name];
-  if (value === undefined || value === "") return fallback;
-  return !/^(0|false|no|off)$/i.test(value.trim());
-}
-
-function toIntAllowZero(value, fallback) {
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
-}
-
-const RATE_LIMIT = {
-  enabled: boolFromEnv("SENSENOVA_RATE_LIMIT", true),
-  /** Requests per minute allowed per model id. */
-  rpm: toInt(process.env.SENSENOVA_RPM, 20),
-  /** Burst tokens available before the per-minute refill starts governing. */
-  burst: toInt(process.env.SENSENOVA_BURST, 2),
-  /** Give up waiting for a bucket slot after this long and send anyway. */
-  maxWaitMs: toInt(process.env.SENSENOVA_MAX_WAIT_MS, 180_000),
-  /** Retries for transient 429/5xx inside the fetch wrapper. */
-  retries: toIntAllowZero(process.env.SENSENOVA_MAX_RETRIES, 2),
-  backoffBaseMs: toInt(process.env.SENSENOVA_BACKOFF_BASE_MS, 1_500),
-  backoffMaxMs: toInt(process.env.SENSENOVA_BACKOFF_MAX_MS, 30_000),
-  cooldownBaseMs: toInt(process.env.SENSENOVA_COOLDOWN_BASE_MS, 15_000),
-  cooldownMaxMs: toInt(process.env.SENSENOVA_COOLDOWN_MAX_MS, 120_000),
-};
-
-function abortError() {
-  const error = new Error("Request aborted");
-  error.name = "AbortError";
-  return error;
-}
-
-/**
- * Abortable sleep. The timer must stay referenced: it is the only thing keeping
- * the event loop alive while a request is parked waiting for a bucket token,
- * and an unref'd timer lets Node exit with the request still pending.
- */
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(abortError());
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, Math.max(0, ms));
-    function onAbort() {
-      clearTimeout(timer);
-      reject(abortError());
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-/** OpenAI `Retry-After` is either an integer number of seconds or an HTTP date. */
-function parseRetryAfterMs(headers) {
-  if (!headers) return undefined;
-  const raw = typeof headers.get === "function" ? headers.get("retry-after") : headers["retry-after"];
-  if (raw === null || raw === undefined) return undefined;
-  const text = String(raw).trim();
-  if (/^\d+$/.test(text)) return Math.floor(Number(text) * 1000);
-  // Only attempt a date when the value actually looks like one; V8's
-  // Date.parse happily turns "3.5" into a valid year.
-  if (/[a-z]/i.test(text)) {
-    const when = Date.parse(text);
-    if (Number.isFinite(when)) return Math.max(0, when - Date.now());
-  }
-  return undefined;
-}
-
-const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504, 529]);
-
-/**
- * SenseNova uses the same 429 status for two very different failures. Only the
- * first is worth waiting on; the second is a quota boundary that no in-window
- * wait recovers.
- */
-const QUOTA_EXHAUSTED =
-  /free_quota_exhausted|quota exhausted|plan limit exhausted|token plan limit|usage limit|monthly limit/i;
-
-function isQuotaExhausted(status, body) {
-  // 403 is an authorization/plan error, not a rate limit or sliding window quota
-  // issue. It must never trigger a quota cooldown.
-  if (status === 403 || Number(status) === 403) return false;
-  return QUOTA_EXHAUSTED.test(body);
-}
-
-function firstLine(text) {
-  const line = String(text).replace(/\s+/g, " ").trim();
-  return line.slice(0, 300) || "unknown error";
-}
-
-class ModelBucket {
-  constructor(modelId, config) {
-    this.modelId = modelId;
-    this.rpm = config.rpm;
-    this.burst = Math.max(1, config.burst);
-    this.tokens = this.burst;
-    this.lastRefill = Date.now();
-    this.cooldownUntil = 0;
-    this.consecutiveThrottles = 0;
-    this.requests = 0;
-    this.rateLimited = 0;
-    this.retries = 0;
-    this.totalWaitedMs = 0;
-    this.lastRateLimitedAt = 0;
-    this.lastAcquiredAt = 0;
-  }
-
-  get msPerRequest() {
-    return 60_000 / this.rpm;
-  }
-
-  refill(now) {
-    const elapsed = now - this.lastRefill;
-    if (elapsed <= 0) return;
-    this.tokens = Math.min(this.burst, this.tokens + elapsed / this.msPerRequest);
-    this.lastRefill = now;
-  }
-
-  /** Milliseconds until this bucket will accept another request. */
-  waitMs(now) {
-    if (this.cooldownUntil > now) return this.cooldownUntil - now;
-    this.refill(now);
-    if (this.tokens >= 1) return 0;
-    return (1 - this.tokens) * this.msPerRequest;
-  }
-
-  take(now) {
-    // Refilling here would hand back the token a caller just spent, so the
-    // burst would never be observable. waitMs() refills before deciding.
-    this.tokens = Math.max(0, this.tokens - 1);
-    this.requests += 1;
-    this.lastAcquiredAt = now;
-  }
-}
-
-class RateLimiter {
-  constructor(config) {
-    this.config = config;
-    this.buckets = new Map();
-  }
-
-  bucket(modelId) {
-    let bucket = this.buckets.get(modelId);
-    if (!bucket) {
-      bucket = new ModelBucket(modelId, this.config);
-      this.buckets.set(modelId, bucket);
-    }
-    return bucket;
-  }
-
-  /**
-   * Wait until the model has a bucket token. Aborts propagate; exceeding
-   * maxWaitMs sends anyway so the gateway can answer with a real 429 and
-   * update the cooldown, rather than hanging indefinitely.
-   */
-  async acquire(modelId, signal) {
-    if (!this.config.enabled) return;
-    const bucket = this.bucket(modelId);
-    const started = Date.now();
-
-    for (;;) {
-      if (signal?.aborted) return;
-      const now = Date.now();
-      const wait = bucket.waitMs(now);
-
-      if (wait <= 0) {
-        bucket.take(now);
-        if (bucket.cooldownUntil <= now) bucket.consecutiveThrottles = 0;
-        return;
-      }
-
-      const remaining = this.config.maxWaitMs - (now - started);
-      if (remaining <= 0) {
-        bucket.take(now);
-        return;
-      }
-
-      const step = Math.min(wait, remaining);
-      bucket.totalWaitedMs += step;
-      try {
-        await sleep(step, signal);
-      } catch (error) {
-        if (error?.name === "AbortError" || signal?.aborted) return;
-        throw error;
-      }
-    }
-  }
-
-  /**
-   * Record a throttle on the model. Consecutive throttles escalate the cooldown
-   * geometrically so the model stays quiet instead of re-probing every tick.
-   * Returns the cooldown applied, in ms.
-   */
-  onRateLimited(modelId, headers, { status } = {}) {
-    const bucket = this.bucket(modelId);
-    const now = Date.now();
-    const requested = parseRetryAfterMs(headers);
-    const escalated = this.config.cooldownBaseMs * 2 ** bucket.consecutiveThrottles;
-    const cooldown = Math.min(Math.max(escalated, requested ?? 0), this.config.cooldownMaxMs);
-    bucket.cooldownUntil = Math.max(bucket.cooldownUntil, now + cooldown);
-    bucket.consecutiveThrottles += 1;
-    bucket.rateLimited += 1;
-    bucket.lastRateLimitedAt = now;
-    bucket.lastStatus = status ?? undefined;
-    return cooldown;
-  }
-
-  onRetried(modelId) {
-    this.bucket(modelId).retries += 1;
-  }
-
-  /**
-   * A quota boundary: park the model for well over the cooldown cap so a
-   * higher-level retry does not hammer an endpoint that cannot recover.
-   */
-  onQuotaExhausted(modelId, headers, status) {
-    if (status === 403 || Number(status) === 403) return 0;
-    const bucket = this.bucket(modelId);
-    const now = Date.now();
-    const cooldown = this.onRateLimited(modelId, headers, { status });
-    bucket.cooldownUntil = Math.max(bucket.cooldownUntil, now + Math.max(this.config.cooldownMaxMs, 10 * 60_000));
-    bucket.consecutiveThrottles = 0;
-    bucket.lastStatus = status ?? undefined;
-    return cooldown;
-  }
-
-  onSucceeded(modelId) {
-    const bucket = this.bucket(modelId);
-    bucket.consecutiveThrottles = 0;
-    bucket.lastStatus = undefined;
-  }
-
-  reset(modelId) {
-    if (modelId) this.buckets.delete(modelId);
-    else this.buckets.clear();
-  }
-
-  snapshot() {
-    return [...this.buckets.values()]
-      .sort((a, b) => a.modelId.localeCompare(b.modelId))
-      .map((bucket) => ({
-        model: bucket.modelId,
-        requests: bucket.requests,
-        rateLimited: bucket.rateLimited,
-        retries: bucket.retries,
-        tokens: Math.floor(bucket.tokens * 100) / 100,
-        cooldownRemainingMs: Math.max(0, bucket.cooldownUntil - Date.now()),
-        consecutiveThrottles: bucket.consecutiveThrottles,
-        totalWaitedMs: Math.round(bucket.totalWaitedMs),
-        lastRateLimitedAt: bucket.lastRateLimitedAt || undefined,
-      }));
-  }
-}
-
-const rateLimiter = new RateLimiter(RATE_LIMIT);
-
-function describeHttpError(status, body) {
-  if (isQuotaExhausted(status, body)) {
-    return `quota exhausted: ${firstLine(body)}. Waiting does not recover this; the free quota is a per-model sliding window. Check the Token Plan console.`;
-  }
-  if (status === 429) {
-    return `rate limited: ${firstLine(body)}. The model is throttled and queued requests will back off.`;
-  }
-  return firstLine(body);
-}
-
-/**
- * Re-emit a consumed error response. pi-ai formats the provider error from the
- * status and body, so the response has to come back intact rather than being
- * replaced by a thrown error (which the OpenAI SDK would collapse into a bare
- * "Connection error.").
- */
-function errorResponse(status, body, detail) {
-  const text = body.trim().startsWith("{")
-    ? JSON.stringify({ error: { message: detail } })
-    : `{"error":{"message":"${detail.replace(/"/g, "\\\"").replace(/\n/g, " ")}"}}`;
-  return new Response(text, {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
 
 /**
  * Remove proprietary OpenAI Responses fields not accepted by the SenseNova
- * Responses gateway (`reasoning.encrypted_content` and `prompt_cache_key`).
+ * Responses gateway (`reasoning.encrypted_content`, `prompt_cache_key`, and `reasoning.summary`).
  */
 function sanitizeResponsesParams(params) {
   if (!params || typeof params !== "object") return params;
@@ -542,100 +250,17 @@ function sanitizeResponsesParams(params) {
 }
 
 /**
- * Wraps the caller's fetch so every outbound request is paced and retried.
- * Injected through pi-ai's `options.fetch`, which both built-in OpenAI adapters
- * pass straight to the OpenAI client.
+ * Wraps openAIResponsesApi stream/streamSimple to sanitize proprietary OpenAI fields
+ * before sending to SenseNova /v1/responses.
  */
-function makeRateLimitedFetch(modelId, inner) {
-  if (!RATE_LIMIT.enabled) return inner;
-  const target = typeof inner === "function" ? inner : globalThis.fetch.bind(globalThis);
-  if (!modelId) return target;
-
-  return async (input, init) => {
-    const signal = init?.signal;
-    await rateLimiter.acquire(modelId, signal);
-
-    let finalInit = init;
-    const urlStr = typeof input === "string" ? input : input instanceof URL ? input.href : input?.url ?? "";
-    if (urlStr.includes("/responses") && init?.body && typeof init.body === "string") {
-      try {
-        const parsed = JSON.parse(init.body);
-        sanitizeResponsesParams(parsed);
-        finalInit = { ...init, body: JSON.stringify(parsed) };
-      } catch {
-        // Keep original body if parsing fails.
-      }
-    }
-
-    for (let attempt = 0; ; attempt++) {
-      const response = await target(input, finalInit);
-
-      if (response.status === 403) {
-        // 403 is an authorization/plan issue, not a rate limit or sliding window quota
-        // issue. Fail fast immediately without retry or placing the bucket in cooldown.
-        const bucket = rateLimiter.bucket(modelId);
-        if (bucket.cooldownUntil > Date.now()) {
-          bucket.cooldownUntil = 0;
-        }
-        rateLimiter.onSucceeded(modelId);
-        return response;
-      }
-
-      if (!RETRYABLE_STATUS.has(response.status)) {
-        rateLimiter.onSucceeded(modelId);
-        return response;
-      }
-
-      // The body is consumed and discarded so the response can be re-sent.
-      let body = "";
-      try {
-        body = (await response.text()) ?? "";
-      } catch {
-        body = "";
-      }
-
-      const quotaExhausted = isQuotaExhausted(response.status, body);
-      if (quotaExhausted) {
-        rateLimiter.onQuotaExhausted(modelId, response.headers, response.status);
-        return errorResponse(response.status, body, describeHttpError(response.status, body));
-      }
-
-      if (attempt >= RATE_LIMIT.retries || signal?.aborted) {
-        rateLimiter.onRateLimited(modelId, response.headers, { status: response.status });
-        return errorResponse(response.status, body, describeHttpError(response.status, body));
-      }
-
-      rateLimiter.onRetried(modelId);
-      const cooldown = rateLimiter.onRateLimited(modelId, response.headers, {
-        status: response.status,
-      });
-      const exponential = Math.min(
-        RATE_LIMIT.backoffMaxMs,
-        RATE_LIMIT.backoffBaseMs * 2 ** attempt,
-      );
-      const jitter = exponential * (0.25 + Math.random() * 0.5);
-      // Never retry sooner than the cooldown the throttle just imposed.
-      const waitMs = Math.min(
-        Math.max(jitter, cooldown),
-        RATE_LIMIT.maxWaitMs,
-      );
-      await sleep(waitMs, signal);
-    }
-  };
-}
-
-/** Wraps a pi-ai ProviderStreams pair so all its requests go through the limiter. */
-function withRateLimit(streams) {
-  if (!RATE_LIMIT.enabled || !streams || typeof streams !== "object") return streams;
+function withSanitizedResponses(streams) {
+  if (!streams || typeof streams !== "object") return streams;
   const wrap = (fn) => {
     if (typeof fn !== "function") return fn;
     return (model, context, options) => {
-      const { fetch: callerFetch, onPayload: callerOnPayload, ...rest } = options ?? {};
+      const { onPayload: callerOnPayload, ...rest } = options ?? {};
       const onPayload = async (params, m) => {
-        let transformed = params;
-        if ((m?.api ?? model?.api) === RESPONSES_API) {
-          transformed = sanitizeResponsesParams(transformed);
-        }
+        let transformed = sanitizeResponsesParams(params);
         if (typeof callerOnPayload === "function") {
           const res = await callerOnPayload(transformed, m);
           if (res !== undefined) transformed = res;
@@ -645,7 +270,6 @@ function withRateLimit(streams) {
       return fn(model, context, {
         ...rest,
         onPayload,
-        fetch: makeRateLimitedFetch(model?.id, callerFetch),
       });
     };
   };
@@ -1036,7 +660,7 @@ async function generateImages(model, context, options) {
     const nextParams = await options?.onPayload?.(params, model);
     if (nextParams !== undefined) params = nextParams;
 
-    const fetchImpl = makeRateLimitedFetch(model.id, options?.fetch);
+    const fetchImpl = options?.fetch ?? globalThis.fetch;
     const response = await fetchImpl(url, {
       method: "POST",
       headers: {
@@ -1133,8 +757,8 @@ export default function (pi) {
     models: SEED_MODELS,
     fetchModels: fetchCatalog,
     api: {
-      [RESPONSES_API]: withRateLimit(openAIResponsesApi()),
-      [COMPLETIONS_API]: withRateLimit(openAICompletionsApi()),
+      [RESPONSES_API]: withSanitizedResponses(openAIResponsesApi()),
+      [COMPLETIONS_API]: openAICompletionsApi(),
     },
     images: {
       [IMAGE_API]: { generateImages },
@@ -1146,7 +770,6 @@ export default function (pi) {
   registerModelCommands(pi);
   registerRefreshCommand(pi);
   registerUsageCommand(pi);
-  registerThrottleCommand(pi);
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,89 +994,6 @@ function registerUsageCommand(pi) {
 }
 
 // ---------------------------------------------------------------------------
-// Rate limiting status
-// ---------------------------------------------------------------------------
-
-function formatDuration(ms) {
-  if (ms <= 0) return "—";
-  const seconds = Math.ceil(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ${seconds % 60}s`;
-}
-
-function registerThrottleCommand(pi) {
-  if (typeof pi.registerCommand !== "function") return;
-
-  pi.registerCommand("sensenova-throttle", {
-    description:
-      "Show client-side rate limiting state per model. Argument `reset` clears all cooldowns.",
-    handler: async (args, ctx) => {
-      const tokens = (args || "").trim().split(/\s+/).filter(Boolean);
-      const wantReset = tokens[0]?.toLowerCase() === "reset";
-      if (wantReset) rateLimiter.reset();
-
-      const rows = rateLimiter.snapshot();
-      const totalRequests = rows.reduce((sum, row) => sum + row.requests, 0);
-      const totalLimited = rows.reduce((sum, row) => sum + row.rateLimited, 0);
-      const totalRetries = rows.reduce((sum, row) => sum + row.retries, 0);
-      const totalWaited = rows.reduce((sum, row) => sum + row.totalWaitedMs, 0);
-
-      const settingsRows = RATE_LIMIT.enabled
-        ? [
-            "| Setting | Value |",
-            "|---|---:|",
-            `| Requests / minute per model | ${RATE_LIMIT.rpm} |`,
-            `| Burst | ${RATE_LIMIT.burst} |`,
-            `| Retry attempts | ${RATE_LIMIT.retries} |`,
-            `| Backoff | ${formatDuration(RATE_LIMIT.backoffBaseMs)} \u2192 ${formatDuration(RATE_LIMIT.backoffMaxMs)} |`,
-            `| Cooldown | ${formatDuration(RATE_LIMIT.cooldownBaseMs)} \u2192 ${formatDuration(RATE_LIMIT.cooldownMaxMs)} |`,
-            `| Max wait for a slot | ${formatDuration(RATE_LIMIT.maxWaitMs)} |`,
-          ]
-        : [];
-
-      const bucketRows = rows.length
-        ? [
-            "| Model | Requests | Limited | Retried | Tokens | Cooldown left | Waited |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-            ...rows.map(
-              (row) =>
-                `| \`${row.model}\` | ${row.requests} | ${row.rateLimited} | ${row.retries} | ${row.tokens} | ${formatDuration(row.cooldownRemainingMs)} | ${formatDuration(row.totalWaitedMs)} |`,
-            ),
-            "",
-            `**Totals:** ${totalRequests} requests, ${totalLimited} throttles, ${totalRetries} retries, ${formatDuration(totalWaited)} spent waiting.`,
-          ]
-        : ["_No requests sent from this process yet._"];
-
-      const banner = wantReset
-        ? "\u2705 Cooldowns cleared."
-        : RATE_LIMIT.enabled
-          ? ""
-          : "Client-side rate limiting is disabled (`SENSENOVA_RATE_LIMIT=0`); requests go out unpaced.";
-
-      const markdown = [
-        `# SenseNova rate limiting${RATE_LIMIT.enabled ? "" : " (disabled)"}`,
-        "",
-        banner,
-        "",
-        ...settingsRows,
-        "",
-        ...bucketRows,
-        "",
-        "Tune with `SENSENOVA_RPM`, `SENSENOVA_BURST`, `SENSENOVA_MAX_RETRIES`,",
-        "`SENSENOVA_COOLDOWN_MAX_MS`, or disable entirely with `SENSENOVA_RATE_LIMIT=0`.",
-        "Pi's own `retry.provider.maxRetries` is a separate, orthogonal knob.",
-      ]
-        .filter((line) => line !== undefined)
-        .join("\n");
-      showMarkdown(pi, ctx, "sensenova-throttle", markdown);
-      registerMarkdownRenderer(pi, "sensenova-throttle");
-    },
-  });
-  registerMarkdownRenderer(pi, "sensenova-throttle");
-}
-
-// ---------------------------------------------------------------------------
 // Exports for tests and out-of-process tooling
 // ---------------------------------------------------------------------------
 
@@ -1474,18 +1014,7 @@ export const __testing = {
   extractPromptAndReferences,
   parseImageUsage,
   generateImages,
-  RATE_LIMIT,
-  RateLimiter,
-  rateLimiter,
-  ModelBucket,
-  makeRateLimitedFetch,
-  withRateLimit,
-  isQuotaExhausted,
-  describeHttpError,
-  errorResponse,
-  parseRetryAfterMs,
-  RETRYABLE_STATUS,
-  sleep,
   sanitizeResponsesParams,
+  withSanitizedResponses,
   buildThinkingLevelMap,
 };
