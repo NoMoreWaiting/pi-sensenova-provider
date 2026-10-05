@@ -139,6 +139,28 @@ for (const block of result.output) if (block.type === "image") image(block);
 
 `/sensenova-usage` 统计范围仅限本进程。本 provider 不暴露账户级统一计费接口。
 
+## 已知问题
+
+**本 Provider 不内置客户端限流器**,上游 429 直接透传给 pi,由 pi 自己的 `retry.provider.maxRetries`(默认 `0`)决定是否重试。
+
+早期版本(commit `6ccdf6a`)在 fetch 层包了令牌桶 + 429 冷却 + 指数退避重试,实测会**阻塞 pi 的响应流**:
+
+- 令牌桶满后请求最长排队等 `SENSENOVA_MAX_WAIT_MS`(默认 180s)才发出,期间没有错误、没有进度,pi 侧表现为"响应到一半就中断"。
+- 一次 429 触发冷却升级,连打两次到 120s;若被误分类为 `FREE_QUOTA_EXHAUSTED`,直接进 10 分钟长挂起。
+- fetch wrapper 包在 pi-ai 的 `options.fetch` 上,任何非致命错误都可能截断整条 stream,而 pi 看到的只是"响应中途中断"。
+
+commit `665cfbe` 撤掉了整套机制。当前行为:
+
+- 上游 429 由 pi 自己处理,扩展不做本地重试。
+- `npm run smoke` 用 `/rps exhausted|tpm/rpm limit|RateLimitExceeded/` 识别限流,作为**警告**打印而非失败,便于观察但不阻塞主流程。
+
+如果要在扩展内恢复限流,注意:
+
+1. 不要前置令牌桶排队——请求先发出、让网关回答,再决定是否等待。
+2. 单次等待上限 ≤ 5s,超过 pi 会感知到"响应中断"。
+3. 识别并跳过 `FREE_QUOTA_EXHAUSTED` / `token plan limit exhausted`——硬配额重试无意义。
+4. 冷却不要阻塞 fetch 主链路,避免并发会话互相影响。
+
 ## 开发
 
 Peer 依赖(`@earendil-works/pi-ai`、`@earendil-works/pi-coding-agent`)由 Pi 在运行时提供,不随包分发。
