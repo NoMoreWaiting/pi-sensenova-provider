@@ -62,44 +62,47 @@ Key 会写入 `~/.pi/agent/auth.json`,`SENSENOVA_API_KEY` 作为回退。Key 在
 
 种子目录(实时目录快照):
 
-| 模型 | 类型 | API | 上下文 | 最大输出 |
-|---|---|---|---:|---:|
-| `sensenova-6.8-flash-lite` | chat,文本+图像输入 | responses | 262144 | 65536 |
-| `deepseek-v4-flash` | chat | responses | 1048576 | 65536 |
-| `deepseek-v4.1-flash` | chat | responses | 1048576 | 65536 |
-| `glm-5.2` | chat | responses | 1048576 | 131072 |
-| `kimi-k3` | chat | responses | 1048576 | 65536 |
-| `sensenova-u1-fast` | image | images | — | — |
-| `sensenova-u1.5-lite` | image | images | — | — |
+| 模型 | 类型 | API | 上下文 | 最大输出 | 支持的思考强度 |
+|---|---|---|---:|---:|---|
+| `sensenova-6.8-flash-lite` | chat,文本+图像输入 | responses | 262144 | 65536 | off, low, medium, high, max |
+| `deepseek-v4-flash` | chat | responses | 1048576 | 65536 | off, low, medium, high, max |
+| `deepseek-v4.1-flash` | chat | responses | 1048576 | 65536 | off, low, medium, high, max |
+| `deepseek-v4-pro` | chat | responses | 1048576 | 131072 | off, low, medium, high, max |
+| `deepseek-flash` | chat | responses | 1048576 | 65536 | off, minimal, low, medium, high, xhigh, max |
+| `glm-5.2` | chat | responses | 1048576 | 131072 | off, minimal, low, medium, high, xhigh, max |
+| `kimi-k3` | chat | responses | 1048576 | 65536 | off, low, medium, high, max |
+| `sensenova-u1-fast` | image | images | — | — | — |
+| `sensenova-u1.5-lite` | image | images | — | — | — |
 
-平台支持 `/v1/responses` 的模型会路由到该接口,其余回退到 `/v1/chat/completions`。平台扩充该列表时,把模型加到 `extensions/sensenova.ts` 的 `RESPONSES_MODELS` 即可。
+平台支持 `/v1/responses` 的模型会路由到该接口,其余回退到 `/v1/chat/completions`。所有 `sensenova|deepseek|glm|kimi` 族系对话模型已默认路由至兼容性最佳的 `/v1/responses`。
 
 ### 已在真实网关上验证的接口能力
 
-- `store: true` 被拒绝(`store=true is not supported in stateless mode`),`previous_response_id` 也被拒绝(`pass the complete history in input`)。pi 的 Responses 适配器本来就发送 `store: false` 加完整对话历史,正好符合网关要求。
-- `prompt_cache_key`、`prompt_cache_retention`、`prompt_cache_options`、`include: ["reasoning.encrypted_content"]`、工具 `strict: true`、`parallel_tool_calls`、`service_tier` 在 `/v1/responses` 上全部被接受。
+- `store: true` 被拒绝(`store=true is not supported in stateless mode`),`previous_response_id` 也被拒绝(`pass the complete history in input`)。pi 的 Responses 适配器默认发送 `store: false` 加完整对话历史。
+- 商汤网关使用严格结构体反序列化,拒绝未知字段如 `reasoning.summary`(`json: unknown field "summary"`)。Provider 自动在请求拦截层净化 `/v1/responses` 的 payload,剔除 `summary`、`encrypted_content` 与 `prompt_cache_key`。
 - `developer` 角色在 `/v1/responses` 上可用,但在 `/v1/chat/completions` 上被拒绝,所以 completions 模型设置 `supportsDeveloperRole: false`,由 pi 折叠进 `system`。
-- `reasoning.effort` 接受 `none | low | medium | high | xhigh`,`none` 返回零推理 token。`reasoning.summary: "none"` 被拒绝,因此沿用 pi 默认的 `summary: "auto"`。
-- Chat Completions 接受 pi 的完整 payload 形状:`stream_options`、`store: false`、`thinking: { type }`、`reasoning_effort`、`max_tokens`。
-- `text.format` JSON Schema 约束输出在 `deepseek-v4-flash`、`glm-5.2`、`kimi-k3` 上可用,但在 `sensenova-6.8-flash-lite` 上因上游 `compile_grammar_error` 失败。只有已验证的模型开启 `supportsOpenAIGrammarTools`。
-- 图像编辑要求 PNG/JPEG/WebP、≤10 MB、宽高均在 256–4096 px 之间、宽高比不超过 2:1。
+- 403 权限错误(如当前 Token Plan 套餐未开通某模型)实行秒级 fast-fail,不会触发限流器的 10 分钟长冷却而导致 Pi 会话挂起。
+- 关闭 Lark 语法的 Grammar Tools(`supportsOpenAIGrammarTools: false`),使用标准稳健的 JSON Schema 避免商汤分词器触发 `compile_grammar_error`。
+- 图像生成与编辑自动支持 Base64 数据解码并持久化至本地 `.pi/generated-images/` 目录。
 - Token Plan 预览期内,`/v1/models` 返回的所有模型价格均为 `0`。
 
 ## 思考等级
 
-`reasoning: true` 取自模型的 `supported_features`,新发现的模型会自动获得该标记。pi 等级到网关参数的映射如下:
+`reasoning: true` 依据模型接口元数据的 `supported_features`（包含 `"reasoning"`）自动标记，同时代码对 `sensenova|deepseek|glm|kimi` 等前缀模型做保底自动识别。
 
-| pi 等级 | `/v1/responses` | `/v1/chat/completions` |
+不同于粗暴的别名映射（例如把 `minimal` 映射为 `low` 或把 `max` 映射为 `xhigh`），本 Provider **严格依据商汤官方文档（https://platform.sensenova.cn/docs）和模型真实能力，为每个模型精确声明支持的档位**。不支持的档位显式设为 `null`，以便 Pi 的 `getSupportedThinkingLevels(model)` 准确向用户和交互界面展示可选列表：
+
+| 模型 | 支持的 Pi 思考等级 | 对应商汤参数值 (`reasoning.effort`) |
 |---|---|---|
-| off | `reasoning.effort: "none"` | `thinking: { type: "disabled" }` |
-| minimal | `"low"` | `"low"` |
-| low | `"low"` | `"low"` |
-| medium | `"medium"` | `"medium"` |
-| high | `"high"` | `"high"` |
-| xhigh | `"xhigh"` | `"high"` |
-| max | `"xhigh"` | `"high"` |
+| `sensenova-6.8-flash-lite` | `off`, `low`, `medium`, `high`, `max` | `none`, `low`, `medium`, `high`, `max` |
+| `deepseek-v4-flash` / `pro` / `v4.1-flash` | `off`, `low`, `medium`, `high`, `max` | `none`, `low`, `medium`, `high`, `max` |
+| `kimi-k3` | `off`, `low`, `medium`, `high`, `max` | `none`, `low`, `medium`, `high`, `max` |
+| `glm-5.2` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (全 7 档) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `deepseek-flash` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (全 7 档) | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 
-注意 Responses 的默认行为:未指定思考等级时,pi 会发送 `reasoning.effort: "none"`,模型不会做推理直接回答。需要在 Pi 设置里指定思考等级才会产生推理。
+- `off` 统一对应商汤网关的 `"none"`（即关闭推理，模型不产生思考 Token 直接作答）。
+- 若上游接口未来通过 `supported_reasoning_efforts` 下发档位，Provider 会优先动态提取，平滑升级。
+- 支持通过 `npm run sync-docs` 自动抓取并比对商汤官网文档的最新档位定义。
 
 ## 限流与重试
 
@@ -211,7 +214,8 @@ for (const block of result.output) if (block.type === "image") image(block);
 Peer 依赖(`@earendil-works/pi-ai`、`@earendil-works/pi-coding-agent`)由 Pi 在运行时提供,不随包分发。
 
 ```bash
-npm test                          # 43 个单元测试,不联网
+npm test                          # 52 个单元测试,不联网
+npm run sync-docs                 # 从商汤官方文档逆向解析并校验最新思考强度规格
 npm run smoke                     # 打真实网关的端到端检查
 npm run demo:ratelimit            # 演示限流器如何平抑并发突发
 npm pack --dry-run                # 校验打包文件清单

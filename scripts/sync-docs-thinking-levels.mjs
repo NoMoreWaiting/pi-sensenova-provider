@@ -5,11 +5,24 @@
  * (reasoning_effort) specifications for each model, and outputs a report.
  *
  * Usage:
+ *   npm run sync-docs
  *   node scripts/sync-docs-thinking-levels.mjs
  */
 
 const DOCS_URL = "https://platform.sensenova.cn/docs";
 const BASE_ORIGIN = "https://platform.sensenova.cn";
+
+const KNOWN_MODELS = [
+  "sensenova-6.8-flash-lite",
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4.1-flash",
+  "deepseek-flash",
+  "glm-5.2",
+  "kimi-k3",
+];
+
+const STANDARD_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 async function fetchHtml(url) {
   const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
@@ -26,61 +39,66 @@ async function extractDocBundleText() {
   for (const chunk of chunks) {
     const chunkUrl = `${BASE_ORIGIN}/_next/${chunk}`;
     const text = await fetchHtml(chunkUrl);
-    if (text.includes("reasoning_effort") && (text.includes("思考模式") || text.includes("思考强度"))) {
+    if (text.includes("reasoning_effort") && text.includes("{#model-")) {
       console.log(`[sync-docs] Found documentation payload inside chunk: ${chunk}`);
       return text;
     }
   }
 
-  throw new Error("Could not find documentation bundle containing reasoning_effort");
+  throw new Error("Could not find documentation bundle containing model documentation");
 }
 
 function parseModelEfforts(bundleText) {
-  const knownModels = [
-    "sensenova-6.8-flash-lite",
-    "deepseek-v4-flash",
-    "deepseek-v4-pro",
-    "deepseek-v4.1-flash",
-    "deepseek-flash",
-    "glm-5.2",
-    "kimi-k3",
-  ];
+  // Use {#model-...} boundaries to prevent cross-model bleeding
+  const pattern = /## [^#\n]+?\{#model-[^}]+?\}/g;
+  const matches = Array.from(bundleText.matchAll(pattern));
 
   const results = {};
-  const standardEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-  for (const modelId of knownModels) {
-    let searchPos = 0;
-    while (searchPos < bundleText.length) {
-      const idx = bundleText.indexOf(modelId, searchPos);
-      if (idx === -1) break;
+  for (let i = 0; i < matches.length; i++) {
+    const m = matches[i];
+    const start = m.index;
+    const end = i + 1 < matches.length ? matches[i + 1].index : bundleText.length;
+    const section = bundleText.slice(start, end).replace(/\\n/g, "\n").replace(/\\"/g, '"');
 
-      const sub = bundleText.slice(idx, idx + 20000).replace(/\\n/g, "\n").replace(/\\"/g, '"');
-      const reIdx = sub.search(/\|\s*`?reasoning_effort/i);
-      if (reIdx !== -1) {
-        const slice = sub.slice(reIdx, reIdx + 800);
-        const found = standardEfforts.filter((eff) =>
-          new RegExp(`(?:^|[^a-zA-Z0-9_-])${eff}(?:$|[^a-zA-Z0-9_-])`, "i").test(slice),
-        );
+    const midMatch = section.match(/model_id[：:]\s*`?([a-zA-Z0-9_\-\.]+)/i);
+    if (!midMatch) continue;
+    const modelId = midMatch[1].toLowerCase();
+    if (results[modelId]) continue; // Prefer the first complete definition
 
-        // Check if none/disable thinking is documented in the surrounding paragraph
-        const surrounding = sub.slice(Math.max(0, reIdx - 300), reIdx + 800);
-        if (!found.includes("none") && /none/i.test(surrounding) && (/关闭/i.test(surrounding) || /disable/i.test(surrounding))) {
-          found.unshift("none");
-        }
+    const rowMatch = section.match(/\|\s*`?reasoning_effort`?[^|\n]*\|([^\n]+)/i);
+    if (!rowMatch) continue;
 
-        if (found.length > 0) {
-          results[modelId] = found;
-          break;
-        }
+    const rowText = rowMatch[0];
+    const found = STANDARD_EFFORTS.filter((eff) => {
+      const re = new RegExp(`(?:^|[^a-zA-Z0-9_-])${eff}(?:$|[^a-zA-Z0-9_-])`, "i");
+      return re.test(rowText);
+    });
+
+    // Check if disabling thinking ("none") is described in the surrounding thinking mode section
+    if (!found.includes("none")) {
+      const rowIdx = section.indexOf(rowText);
+      const surrounding = section.slice(Math.max(0, rowIdx - 500), Math.min(section.length, rowIdx + 2500));
+      if (
+        /none/i.test(surrounding) &&
+        (/关闭/i.test(surrounding) || /disable/i.test(surrounding) || /turn off/i.test(surrounding) || /"reasoning_effort":\s*"none"/i.test(surrounding))
+      ) {
+        found.unshift("none");
       }
-
-      searchPos = idx + modelId.length;
     }
 
-    // Default deepseek-v4 variants if not explicitly present in docs table
-    if (!results[modelId] && modelId.startsWith("deepseek-v4") && results["deepseek-v4-flash"]) {
-      results[modelId] = [...results["deepseek-v4-flash"]];
+    if (found.length > 0) {
+      results[modelId] = found;
+    }
+  }
+
+  // Handle variants that share family documentation (e.g. deepseek-v4-pro shares deepseek-v4-flash)
+  for (const modelId of KNOWN_MODELS) {
+    if (!results[modelId]) {
+      if (modelId.startsWith("deepseek-v4") && results["deepseek-v4-flash"]) {
+        results[modelId] = [...results["deepseek-v4-flash"]];
+        console.log(`[sync-docs] ${modelId} inherited from deepseek-v4-flash documentation.`);
+      }
     }
   }
 
@@ -94,9 +112,9 @@ async function main() {
 
     console.log("\n[sync-docs] Extracted thinking levels from official documentation:\n");
     console.table(
-      Object.entries(specs).map(([model, efforts]) => ({
+      KNOWN_MODELS.map((model) => ({
         Model: model,
-        "Documented Efforts": efforts.join(", "),
+        "Documented Efforts": (specs[model] || []).join(", ") || "NOT FOUND",
       })),
     );
 
